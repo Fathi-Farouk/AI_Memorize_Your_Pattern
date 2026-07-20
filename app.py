@@ -77,9 +77,11 @@ load_dotenv()  # reads .env in the script's own directory if present — see PAT
 # Shared instruction block prepended to every AI call (via the 'system' role for Anthropic,
 # folded into the user message for the internal/Huawei branch — see call_llm below for why).
 SCOPE_GUARD = (
-    "You are a specialized assistant embedded inside a script-validation tool for telecom RF "
-    "activation/rollback MML scripts. You may only discuss loaded scripts, sites, cells, "
-    "parameters, mismatches, and related RF script-validation topics."
+    "You are a specialized assistant embedded inside a script-validation tool for telecom network "
+    "configuration scripts (RF, Core, IMS, Transport, or any other domain/vendor). You may only "
+    "discuss loaded scripts, sites, cells, parameters, mismatches, and related script-validation "
+    "topics — never assume RF-specific conventions apply; infer everything from what's actually "
+    "in front of you."
 )
 
 
@@ -417,34 +419,49 @@ class TrainState(TypedDict):
 def trainer_node(state: TrainState) -> dict:
     if state["round"] == 1:
         prompt = (
-            "You are studying a CONFIRMED-CORRECT pair of telecom RF network configuration scripts: "
-            "one activation script and its matching rollback script. Learn the format conventions from "
+            "You are studying a CONFIRMED-CORRECT pair of telecom network configuration scripts — "
+            "one activation script and its matching rollback script, from ANY domain or vendor (RF, "
+            "Core, IMS, Transport, etc.). Learn the format conventions from "
             "these two real examples so the same rules can be applied to other files in this exact format "
             "later. Do not assume any particular vendor syntax in advance — infer everything purely from "
             "what you observe.\n\n"
             f"ACTIVATION SAMPLE:\n{state['activation_text'][:7000]}\n\n"
             f"ROLLBACK SAMPLE:\n{state['rollback_text'][:7000]}\n\n"
+            "IMPORTANT — identify which parameters are IDENTIFIERS vs TOGGLES: compare matching lines "
+            "between the two samples. Some parameters (e.g. a board name, a gateway name, a cell ID) "
+            "carry the SAME value in both activation and rollback — they identify WHICH target the "
+            "command applies to, not WHAT to change, so they are expected to match and must never be "
+            "flagged as a bug. Other parameters (e.g. a flag ending in -1 vs -0) genuinely differ between "
+            "activation and rollback — that's the actual change being made. List every parameter NAME you "
+            "observe behaving as an identifier in 'identifierParamNames'. Do not assume any particular "
+            "field is or isn't an identifier based on what a typical RF or Core script might use — decide "
+            "purely from what these two real samples actually show.\n\n"
             "Your ENTIRE response must be a single JSON object and nothing else. Do not restate these "
             "instructions, do not explain your reasoning, do not add any words before or after the JSON — "
             "your first character must be { and your last character must be }. Keep each value to ONE "
-            "concise sentence: "
+            "concise sentence, except identifierParamNames which is a list of exact parameter name strings: "
             '{"vendorGuess":"...","siteIdRule":"...","cellIdRule":"...","commandRule":"...","paramRule":"...",'
-            '"reversalRule":"...","matchingCommandsRule":"...","commentRule":"...","notes":"..."}'
+            '"reversalRule":"...","matchingCommandsRule":"...","commentRule":"...",'
+            '"identifierParamNames":["...", "..."],"notes":"..."}'
         )
     else:
         issues_text = state.get("teacher_feedback") or "no specific feedback provided"
         prompt = (
-            "You previously proposed a format spec for telecom RF activation/rollback scripts, but the "
+            "You previously proposed a format spec for telecom network configuration scripts (any "
+            "domain or vendor — RF, Core, IMS, Transport, etc.), but the "
             "Teacher agent tested it against independent samples and found problems. Refine the spec.\n\n"
             f"ORIGINAL ACTIVATION SAMPLE:\n{state['activation_text'][:5000]}\n\n"
             f"ORIGINAL ROLLBACK SAMPLE:\n{state['rollback_text'][:5000]}\n\n"
             f"PREVIOUS CANDIDATE SPEC:\n{json.dumps(state['candidate_pattern'])}\n\n"
             f"TEACHER'S FEEDBACK (round {state['round']-1}):\n{issues_text}\n\n"
-            "Produce a REVISED JSON object fixing these issues. Your ENTIRE response must be a single JSON "
-            "object and nothing else — no restating instructions, no explanation, first character { and "
-            "last character }, same keys as before: "
+            "Produce a REVISED JSON object fixing these issues, including re-checking whether "
+            "identifierParamNames is complete and accurate (a parameter is an identifier if it carries "
+            "the SAME value in both activation and rollback, never a value that reverses). Your ENTIRE "
+            "response must be a single JSON object and nothing else — no restating instructions, no "
+            "explanation, first character { and last character }, same keys as before: "
             '{"vendorGuess":"...","siteIdRule":"...","cellIdRule":"...","commandRule":"...","paramRule":"...",'
-            '"reversalRule":"...","matchingCommandsRule":"...","commentRule":"...","notes":"..."}'
+            '"reversalRule":"...","matchingCommandsRule":"...","commentRule":"...",'
+            '"identifierParamNames":["...", "..."],"notes":"..."}'
         )
 
     raw = call_llm(prompt, max_tokens=6000, provider_override=state.get("provider"), api_key_override=state.get("api_key"), base_url_override=state.get("base_url"), model_override=state.get("model"))
@@ -469,6 +486,13 @@ def teacher_node(state: TrainState) -> dict:
             "You are validating a candidate FORMAT SPEC against an independent confirmed-correct sample "
             "pair it has NOT seen before. Assess whether the spec correctly describes how to find site IDs, "
             "cell IDs, commands, and the activation/rollback reversal rule in THIS sample.\n\n"
+            "ALSO check identifierParamNames specifically: for each parameter name listed there, confirm "
+            "it actually carries the SAME value in both activation and rollback in THIS sample too (not "
+            "just the original training sample). If a listed identifier actually differs between "
+            "activation/rollback here, or if you see a parameter behaving like an identifier (same value "
+            "both sides) that was NOT listed, flag it as an issue so the Trainer can correct the list — "
+            "getting this wrong causes real check reports to falsely flag legitimate identifiers as bugs, "
+            "or miss genuine ones.\n\n"
             f"CANDIDATE SPEC:\n{json.dumps(pattern)}\n\n"
             f"SAMPLE ACTIVATION (excerpt):\n{sample['activation_text'][:3000]}\n\n"
             f"SAMPLE ROLLBACK (excerpt):\n{sample['rollback_text'][:3000]}\n\n"
@@ -657,7 +681,8 @@ def convert_pattern_into_code_node(state: TrainState) -> dict:
         )
 
     prompt = (
-        "You have learned this format spec for telecom RF activation/rollback scripts, confirmed "
+        "You have learned this format spec for telecom network configuration scripts (any domain "
+        "or vendor — RF, Core, IMS, Transport, etc.), confirmed "
         f"correct against independent samples:\n{json.dumps(state['candidate_pattern'])}\n\n"
         "Here is the REAL sample text this spec was learned from — base every regex on what's "
         "ACTUALLY written here, not on generic assumptions about what a telecom command 'usually' "
@@ -681,6 +706,11 @@ def convert_pattern_into_code_node(state: TrainState) -> dict:
         "captures whatever verb+object structure the command lines actually follow (e.g. two or three "
         "uppercase words at the start of the line before a colon), so it still works on command names "
         "that don't happen to appear in these particular samples.\n"
+        "- Extract EVERY parameter into 'params', including ones the spec's identifierParamNames marks as "
+        "identifiers (e.g. a board name or gateway name expected to match between activation/rollback). "
+        "Do not filter, skip, or special-case those — extract them the same as any other parameter. "
+        "Deciding which ones are identifiers happens elsewhere, after extraction; your only job here is "
+        "to report exactly what each line contains.\n"
         "- Only the 're' module is available (already imported) — no other imports of any kind.\n"
         "- No file I/O, no network, no subprocess, no exec/eval, no __import__.\n"
         "- Define any regex patterns as module-level constants above the function if that helps.\n\n"
@@ -824,6 +854,7 @@ def check(req: CheckRequest):
     if not req.activation_text or not req.rollback_text:
         raise HTTPException(status_code=400, detail="activation_text and rollback_text are required")
     generated_code = req.generated_code
+    identifier_param_names = None
     if not generated_code:
         if not req.pattern_name:
             raise HTTPException(status_code=400, detail="Provide either 'generated_code' or 'pattern_name'")
@@ -833,9 +864,10 @@ def check(req: CheckRequest):
         generated_code, diagnostic = usable_generated_code(match)
         if not generated_code:
             raise HTTPException(status_code=422, detail=f"Pattern '{req.pattern_name}' can't be used yet — {diagnostic}")
+        identifier_param_names = (match.get("pattern") or {}).get("identifierParamNames")
 
     try:
-        result = run_deployment_check(req.activation_text, req.rollback_text, generated_code)
+        result = run_deployment_check(req.activation_text, req.rollback_text, generated_code, identifier_param_names)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Check failed: {type(e).__name__}: {e}")
 
@@ -1057,15 +1089,16 @@ def pair_deployment_files_by_content(filepaths: list, generated_code: str) -> tu
 
 def load_pattern_from_upload(filepath: str) -> tuple:
     """Parses an uploaded pattern JSON file (same shape as one record from learned_patterns.json)
-    and returns (generated_code_or_None, diagnostic_or_None, display_name)."""
+    and returns (generated_code_or_None, diagnostic_or_None, display_name, identifier_param_names)."""
     try:
         record = json.loads(read_text_file(filepath))
     except (json.JSONDecodeError, UnicodeError, OSError) as e:
-        return None, f"Uploaded file is not valid JSON: {e}", None
+        return None, f"Uploaded file is not valid JSON: {e}", None, None
     if not isinstance(record, dict):
-        return None, "Uploaded pattern file must be a JSON object (one saved pattern record).", None
+        return None, "Uploaded pattern file must be a JSON object (one saved pattern record).", None, None
     code, diagnostic = usable_generated_code(record)
-    return code, diagnostic, record.get("name", "uploaded pattern")
+    identifier_param_names = (record.get("pattern") or {}).get("identifierParamNames")
+    return code, diagnostic, record.get("name", "uploaded pattern"), identifier_param_names
 
 
 def _token_values():
@@ -1171,10 +1204,13 @@ def find_spread_sites(lines: list) -> list:
     return list(spread)
 
 
-def find_same_value_matches(act_lines: list, rb_lines: list) -> list:
+def find_same_value_matches(act_lines: list, rb_lines: list, extra_identifier_names: frozenset = frozenset()) -> list:
     """Same value in both activation and rollback for a given site+cell+command+param = the
-    rollback wouldn't actually change anything there. RST-like commands and identifier fields
-    (site/cell id params) are excluded since those are expected to match, not a bug."""
+    rollback wouldn't actually change anything there. RST-like commands and identifier fields are
+    excluded since those are expected to match, not a bug. Identifiers come from two sources: a
+    small built-in RF baseline (_IDENTIFIER_PARAM_RE) and whatever the Trainer/Teacher learned for
+    THIS specific format (extra_identifier_names, e.g. 'MGWNAME' for a Core MGW script) — neither
+    alone is enough for a genuinely vendor-agnostic tool."""
     def build_map(lines):
         m = {}
         for l in lines:
@@ -1183,7 +1219,8 @@ def find_same_value_matches(act_lines: list, rb_lines: list) -> list:
             if l.get("command") and re.match(r"^RST", l["command"], re.IGNORECASE):
                 continue
             for p in l.get("params", []):
-                if _IDENTIFIER_PARAM_RE.match(p.get("name", "")):
+                name = p.get("name", "")
+                if _IDENTIFIER_PARAM_RE.match(name) or name.lower() in extra_identifier_names:
                     continue
                 key = (l.get("siteId"), l.get("cellId"), l.get("command"), p.get("name"))
                 m[key] = {"value": p.get("value"), "line": l["lineNum"]}
@@ -1202,17 +1239,18 @@ def find_same_value_matches(act_lines: list, rb_lines: list) -> list:
     return results
 
 
-def build_parameter_summary(act_lines: list, rb_lines: list) -> list:
+def build_parameter_summary(act_lines: list, rb_lines: list, extra_identifier_names: frozenset = frozenset()) -> list:
     """Every parameter's current (rollback) value vs new (activation) value, deduped down to
     distinct combinations rather than one row per site/cell — matches the browser tool's
-    /parameter command. Identifier fields (site/cell id params) are excluded, same as elsewhere."""
+    /parameter command. Identifier fields are excluded the same way as find_same_value_matches."""
     def build_map(lines):
         m = {}
         for l in lines:
             if l["isBlank"] or l["isComment"]:
                 continue
             for p in l.get("params", []):
-                if _IDENTIFIER_PARAM_RE.match(p.get("name", "")):
+                name = p.get("name", "")
+                if _IDENTIFIER_PARAM_RE.match(name) or name.lower() in extra_identifier_names:
                     continue
                 key = (l.get("siteId"), l.get("cellId"), p.get("name"))
                 m[key] = p.get("value")
@@ -1233,14 +1271,15 @@ def build_parameter_summary(act_lines: list, rb_lines: list) -> list:
     return results
 
 
-def run_check(act_lines: list, rb_lines: list) -> dict:
+def run_check(act_lines: list, rb_lines: list, identifier_param_names: Optional[list] = None) -> dict:
+    extra_identifiers = frozenset(n.lower() for n in (identifier_param_names or []))
     a, b = file_stats(act_lines), file_stats(rb_lines)
     site_mismatch_ab = sorted(a["unique_sites"] - b["unique_sites"])
     site_mismatch_ba = sorted(b["unique_sites"] - a["unique_sites"])
     cell_mismatch_ab = sorted(a["unique_cells"] - b["unique_cells"])
     cell_mismatch_ba = sorted(b["unique_cells"] - a["unique_cells"])
-    same_value_matches = find_same_value_matches(act_lines, rb_lines)
-    parameter_summary = build_parameter_summary(act_lines, rb_lines)
+    same_value_matches = find_same_value_matches(act_lines, rb_lines, extra_identifiers)
+    parameter_summary = build_parameter_summary(act_lines, rb_lines, extra_identifiers)
     return {
         "activation": {
             "total_lines": a["total_lines"], "active_lines": a["active_lines"],
@@ -1274,7 +1313,8 @@ def run_check(act_lines: list, rb_lines: list) -> dict:
 # No AI-fallback extractor — deployment is 100% deterministic once a pattern has an approved,
 # validated generated parser. If that parser isn't available, this fails clearly rather than
 # silently falling back to a slower/costlier path.
-def run_deployment_check_stream(activation_text: str, rollback_text: str, generated_code: Optional[str] = None):
+def run_deployment_check_stream(activation_text: str, rollback_text: str, generated_code: Optional[str] = None,
+                                 identifier_param_names: Optional[list] = None):
     """Generator: yields ('progress', message) throughout, then ('done', result_dict) at the end."""
     if not generated_code:
         raise ValueError(
@@ -1288,13 +1328,14 @@ def run_deployment_check_stream(activation_text: str, rollback_text: str, genera
     yield ("progress", "Parsing rollback script with the generated parser...")
     rb_lines = parse_with_generated_code(rollback_text, generated_code)
     yield ("progress", "Running checks...")
-    yield ("done", run_check(act_lines, rb_lines))
+    yield ("done", run_check(act_lines, rb_lines, identifier_param_names))
 
 
-def run_deployment_check(activation_text: str, rollback_text: str, generated_code: Optional[str] = None) -> dict:
+def run_deployment_check(activation_text: str, rollback_text: str, generated_code: Optional[str] = None,
+                          identifier_param_names: Optional[list] = None) -> dict:
     """Blocking wrapper around run_deployment_check_stream, for the REST endpoint."""
     result = None
-    for kind, payload in run_deployment_check_stream(activation_text, rollback_text, generated_code):
+    for kind, payload in run_deployment_check_stream(activation_text, rollback_text, generated_code, identifier_param_names):
         if kind == "done":
             result = payload
     return result
@@ -1581,7 +1622,7 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
         return
 
     if pattern_file:
-        generated_code, diagnostic, source_name = load_pattern_from_upload(pattern_file)
+        generated_code, diagnostic, source_name, identifier_param_names = load_pattern_from_upload(pattern_file)
         source_desc = f"imported pattern file ('{source_name}')"
     elif pattern_name:
         match = next((p for p in load_saved_patterns() if p["name"] == pattern_name), None)
@@ -1589,6 +1630,7 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
             yield (f"⚠️ Pattern '{pattern_name}' not found — try refreshing the pattern list.", "", "")
             return
         generated_code, diagnostic = usable_generated_code(match)
+        identifier_param_names = (match.get("pattern") or {}).get("identifierParamNames")
         source_desc = f"saved pattern '{pattern_name}'"
     else:
         yield ("⚠️ Select a saved pattern, or import a pattern file.", "", "")
@@ -1613,7 +1655,7 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
         log_lines.append(f"\nChecking batch: {pair['label']}...")
         yield ("\n".join(log_lines), "", "")
         try:
-            result = run_deployment_check(pair["activation_text"], pair["rollback_text"], generated_code)
+            result = run_deployment_check(pair["activation_text"], pair["rollback_text"], generated_code, identifier_param_names)
             all_results[pair["label"]] = result
             batch_id = "batch-result-" + re.sub(r"[^a-zA-Z0-9_-]", "_", pair["label"])
             batch_content = format_check_markdown(result)
@@ -1667,8 +1709,8 @@ with gr.Blocks(title="AI Memorize Your Pattern") as demo:
     gr.Markdown("<h1 style='text-align:center;color:#5B9BD5;font-size:42px;'>AI Memorize Your Pattern</h1>")
 
     gr.Markdown(
-        "<p style='text-align:center;font-size:18px;line-height:1.6;'><b>Description:</b> learns how your telecom RF "
-        "activation/rollback script format works from real examples, then checks new script "
+        "<p style='text-align:center;font-size:18px;line-height:1.6;'><b>Description:</b> learns how your telecom "
+        "activation/rollback script format works from real examples — RF, Core, IMS, Transport, any vendor — then checks new script "
         "pairs for site/cell mismatches, duplicate values, missing semicolons, and other "
         "rollback risks — without anyone hand-writing a parser for each vendor's format.</p>"
     )
