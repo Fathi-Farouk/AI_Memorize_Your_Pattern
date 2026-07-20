@@ -1142,6 +1142,7 @@ _IDENTIFIER_PARAM_RE = re.compile(r"^(nrducellid|localcellid|cellid)$", re.IGNOR
 def file_stats(lines: list) -> dict:
     active = [l for l in lines if not l["isBlank"] and not l["isComment"]]
     comments = [l for l in lines if l["isComment"]]
+    blanks = [l for l in lines if l["isBlank"]]
     sites, cells = set(), set()
     for l in lines:
         if l.get("siteId"):
@@ -1153,6 +1154,7 @@ def file_stats(lines: list) -> dict:
         "total_lines": len(lines), "active_lines": len(active),
         "unique_sites": sites, "unique_cells": cells,
         "comment_count": len(comments), "has_comments": len(comments) > 0,
+        "blank_count": len(blanks), "has_blanks": len(blanks) > 0,
         "missing_semicolons": missing_semi, "spread_sites": find_spread_sites(lines),
     }
 
@@ -1244,6 +1246,7 @@ def run_check(act_lines: list, rb_lines: list) -> dict:
             "total_lines": a["total_lines"], "active_lines": a["active_lines"],
             "unique_sites": len(a["unique_sites"]), "unique_cells": len(a["unique_cells"]),
             "comment_count": a["comment_count"], "has_comments": a["has_comments"],
+            "blank_count": a["blank_count"], "has_blanks": a["has_blanks"],
             "missing_semicolons": [l["lineNum"] for l in a["missing_semicolons"]],
             "spread_sites": a["spread_sites"],
         },
@@ -1251,6 +1254,7 @@ def run_check(act_lines: list, rb_lines: list) -> dict:
             "total_lines": b["total_lines"], "active_lines": b["active_lines"],
             "unique_sites": len(b["unique_sites"]), "unique_cells": len(b["unique_cells"]),
             "comment_count": b["comment_count"], "has_comments": b["has_comments"],
+            "blank_count": b["blank_count"], "has_blanks": b["has_blanks"],
             "missing_semicolons": [l["lineNum"] for l in b["missing_semicolons"]],
             "spread_sites": b["spread_sites"],
         },
@@ -1324,6 +1328,7 @@ def format_check_markdown(result: dict) -> str:
             ["Unique sites", result["activation"]["unique_sites"], result["rollback"]["unique_sites"]],
             ["Unique cells", result["activation"]["unique_cells"], result["rollback"]["unique_cells"]],
             ["Comments (//)", result["activation"]["comment_count"], result["rollback"]["comment_count"]],
+            ["Blank lines", result["activation"]["blank_count"], result["rollback"]["blank_count"]],
         ],
     )
 
