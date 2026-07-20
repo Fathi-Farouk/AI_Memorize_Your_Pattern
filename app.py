@@ -1326,7 +1326,7 @@ def format_check_markdown(result: dict) -> str:
             ["Total lines", result["activation"]["total_lines"], result["rollback"]["total_lines"]],
             ["Active lines", result["activation"]["active_lines"], result["rollback"]["active_lines"]],
             ["Unique sites", result["activation"]["unique_sites"], result["rollback"]["unique_sites"]],
-            ["Unique cells", result["activation"]["unique_cells"], result["rollback"]["unique_cells"]],
+            ["Cells Count", result["activation"]["unique_cells"], result["rollback"]["unique_cells"]],
             ["Comments (//)", result["activation"]["comment_count"], result["rollback"]["comment_count"]],
             ["Blank lines", result["activation"]["blank_count"], result["rollback"]["blank_count"]],
         ],
