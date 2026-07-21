@@ -1782,7 +1782,7 @@ with gr.Blocks(title="AI Memorize Your Pattern") as demo:
 
     gr.Markdown(
         "<p style='text-align:center;font-size:18px;line-height:1.6;'><b>Description:</b> learns how your telecom "
-        "activation/rollback script format works from real examples — RF, Core, IMS, Transport, any vendor — then checks new script "
+        "activation/rollback script format works from real examples — RF (Wireless) for any vendor — then checks new script "
         "pairs for site/cell mismatches, duplicate values, missing semicolons, and other "
         "rollback risks — without anyone hand-writing a parser for each vendor's format.</p>"
     )
