@@ -842,6 +842,12 @@ class CheckRequest(BaseModel):
     rollback_text: str
     pattern_name: Optional[str] = None    # look up a saved pattern's generated parser by name...
     generated_code: Optional[str] = None  # ...or pass a generated parser directly (at least one required)
+    pattern_spec: Optional[dict] = None   # required alongside generated_code if pattern_name isn't given —
+                                           # the AI comparison step needs the learned spec, not just the parser
+    provider: str = "anthropic"           # required — the comparison/report step is now a real AI call
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
 
 
 class CheckResponse(BaseModel):
@@ -854,7 +860,7 @@ def check(req: CheckRequest):
     if not req.activation_text or not req.rollback_text:
         raise HTTPException(status_code=400, detail="activation_text and rollback_text are required")
     generated_code = req.generated_code
-    identifier_param_names = None
+    pattern_spec = req.pattern_spec
     if not generated_code:
         if not req.pattern_name:
             raise HTTPException(status_code=400, detail="Provide either 'generated_code' or 'pattern_name'")
@@ -864,10 +870,15 @@ def check(req: CheckRequest):
         generated_code, diagnostic = usable_generated_code(match)
         if not generated_code:
             raise HTTPException(status_code=422, detail=f"Pattern '{req.pattern_name}' can't be used yet — {diagnostic}")
-        identifier_param_names = (match.get("pattern") or {}).get("identifierParamNames")
+        pattern_spec = match.get("pattern")
+
+    config_issue = provider_config_status(req.provider, req.api_key, req.base_url, req.model)
+    if config_issue:
+        raise HTTPException(status_code=400, detail=f"AI comparison step needs credentials — {config_issue}")
 
     try:
-        result = run_deployment_check(req.activation_text, req.rollback_text, generated_code, identifier_param_names)
+        result = run_deployment_check(req.activation_text, req.rollback_text, generated_code,
+                                       pattern_spec, req.provider, req.api_key, req.base_url, req.model)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Check failed: {type(e).__name__}: {e}")
 
@@ -1089,7 +1100,7 @@ def pair_deployment_files_by_content(filepaths: list, generated_code: str) -> tu
 
 def load_pattern_from_upload(filepath: str) -> tuple:
     """Parses an uploaded pattern JSON file (same shape as one record from learned_patterns.json)
-    and returns (generated_code_or_None, diagnostic_or_None, display_name, identifier_param_names)."""
+    and returns (generated_code_or_None, diagnostic_or_None, display_name, pattern_spec_or_None)."""
     try:
         record = json.loads(read_text_file(filepath))
     except (json.JSONDecodeError, UnicodeError, OSError) as e:
@@ -1097,8 +1108,7 @@ def load_pattern_from_upload(filepath: str) -> tuple:
     if not isinstance(record, dict):
         return None, "Uploaded pattern file must be a JSON object (one saved pattern record).", None, None
     code, diagnostic = usable_generated_code(record)
-    identifier_param_names = (record.get("pattern") or {}).get("identifierParamNames")
-    return code, diagnostic, record.get("name", "uploaded pattern"), identifier_param_names
+    return code, diagnostic, record.get("name", "uploaded pattern"), record.get("pattern")
 
 
 def _token_values():
@@ -1309,13 +1319,84 @@ def run_check(act_lines: list, rb_lines: list, identifier_param_names: Optional[
     }
 
 
-# ============================= Deployment: check using the generated parser only =============================
-# No AI-fallback extractor — deployment is 100% deterministic once a pattern has an approved,
-# validated generated parser. If that parser isn't available, this fails clearly rather than
-# silently falling back to a slower/costlier path.
+# ============================= AI-decided summary comparison =============================
+# Replaces the fixed-schema deterministic checker for the FINAL report: instead of always
+# computing "unique sites" / "unique cells" regardless of whether those concepts exist in this
+# format, the AI reads the pattern's own learned structure (siteIdRule, cellIdRule, etc.) plus
+# the extracted lines, and decides what's actually meaningful to report for THIS format — e.g.
+# "Unique boards" instead of a meaningless "Cells Count: 0" for a Core MGW script. Extraction
+# (turning raw text into structured lines) stays deterministic via the generated parser; only
+# the comparison/judgment step is now 100% AI-decided, per explicit choice over the alternative
+# (AI as an optional second opinion alongside a deterministic report).
+_MAX_LINES_FOR_AI_COMPARISON = 300  # per file — real files can run 900+ lines; single-call mode
+
+
+def generate_summary_comparison(act_lines: list, rb_lines: list, pattern_spec: dict,
+                                 provider: Optional[str] = None, api_key: Optional[str] = None,
+                                 base_url: Optional[str] = None, model: Optional[str] = None) -> dict:
+    act_truncated = len(act_lines) > _MAX_LINES_FOR_AI_COMPARISON
+    rb_truncated = len(rb_lines) > _MAX_LINES_FOR_AI_COMPARISON
+    act_sample = act_lines[:_MAX_LINES_FOR_AI_COMPARISON]
+    rb_sample = rb_lines[:_MAX_LINES_FOR_AI_COMPARISON]
+
+    truncation_note = ""
+    if act_truncated or rb_truncated:
+        truncation_note = (
+            f"\n\nNOTE: activation has {len(act_lines)} total lines, rollback has {len(rb_lines)} total lines — "
+            f"only the first {_MAX_LINES_FOR_AI_COMPARISON} of each are shown below due to size. Say so plainly "
+            f"in your notes field rather than presenting counts as if they covered the whole file."
+        )
+
+    prompt = (
+        "You are comparing an activation script against its matching rollback script for a telecom "
+        "network configuration (RF, Core, IMS, Transport, or any other domain/vendor — do not assume "
+        "which). You have the format spec learned from this exact vendor's real samples, and the "
+        "structured lines already extracted by a deterministic parser (site/cell/command/params per "
+        "line, already correct — your job is to COMPARE and JUDGE, not re-parse).\n\n"
+        f"LEARNED FORMAT SPEC:\n{json.dumps(pattern_spec)}\n\n"
+        f"ACTIVATION — extracted lines{' (truncated, see note below)' if act_truncated else ''}:\n{json.dumps(act_sample)}\n\n"
+        f"ROLLBACK — extracted lines{' (truncated, see note below)' if rb_truncated else ''}:\n{json.dumps(rb_sample)}"
+        f"{truncation_note}\n\n"
+        "Decide what's actually meaningful to report for THIS format — do not force RF vocabulary "
+        "('site', 'cell') onto a format that doesn't have those concepts. If this format's real "
+        "structural unit is a board number, a gateway name, a trunk group, or something else "
+        "entirely, name your summary rows and columns after what's REALLY there. Compute:\n"
+        "- Summary stats: total lines, active lines, comment count, blank count, and whatever "
+        "structural units this format actually has (label them accurately, not generically)\n"
+        "- Check items: mismatches between activation/rollback for whatever units matter here, "
+        "missing semicolons on real command lines, duplicate values (same value in both scripts "
+        "for a parameter that should differ — but identifierParamNames from the spec are expected "
+        "to match, that's not a bug)\n"
+        "- Duplicate values found (if any), with enough detail to locate them\n"
+        "- Parameter summary: current (rollback) vs new (activation) value for each distinct "
+        "parameter combination, excluding identifierParamNames\n"
+        "- Overall clean/issues verdict\n\n"
+        "Your ENTIRE response must be a single JSON object and nothing else, matching exactly this "
+        "shape (arrays can be empty, but must be present):\n"
+        '{"clean": true/false, '
+        '"summary_stats": [{"label":"...", "activation":"...", "rollback":"..."}], '
+        '"check_items": [{"label":"...", "clear": true/false, "details":"..."}], '
+        '"duplicate_values": [{"description":"...", "location":"...", "value":"..."}], '
+        '"parameter_summary": [{"parameter":"...", "current":"...", "new":"...", "status":"reversed/same/missing", "applies_to":"..."}], '
+        '"notes": "one or two sentences"}'
+    )
+    raw = call_llm(prompt, max_tokens=4096, provider_override=provider, api_key_override=api_key,
+                    base_url_override=base_url, model_override=model)
+    result = parse_ai_json(raw)
+    for required_key, default in (("clean", False), ("summary_stats", []), ("check_items", []),
+                                   ("duplicate_values", []), ("parameter_summary", []), ("notes", "")):
+        result.setdefault(required_key, default)
+    return result
+
+
 def run_deployment_check_stream(activation_text: str, rollback_text: str, generated_code: Optional[str] = None,
-                                 identifier_param_names: Optional[list] = None):
-    """Generator: yields ('progress', message) throughout, then ('done', result_dict) at the end."""
+                                 pattern_spec: Optional[dict] = None, provider: Optional[str] = None,
+                                 api_key: Optional[str] = None, base_url: Optional[str] = None,
+                                 model: Optional[str] = None):
+    """Generator: yields ('progress', message) throughout, then ('done', result_dict) at the end.
+    Extraction (raw text -> structured lines) stays deterministic via the generated parser. The
+    comparison/report itself is now 100% AI-decided by generate_summary_comparison — this makes
+    an AI call, unlike the previous fully-deterministic version, so it needs real credentials."""
     if not generated_code:
         raise ValueError(
             "This pattern has no working generated parser — deployment checks require one. "
@@ -1327,24 +1408,30 @@ def run_deployment_check_stream(activation_text: str, rollback_text: str, genera
     act_lines = parse_with_generated_code(activation_text, generated_code)
     yield ("progress", "Parsing rollback script with the generated parser...")
     rb_lines = parse_with_generated_code(rollback_text, generated_code)
-    yield ("progress", "Running checks...")
-    yield ("done", run_check(act_lines, rb_lines, identifier_param_names))
+    yield ("progress", "Asking AI to compare and decide the report...")
+    yield ("done", generate_summary_comparison(act_lines, rb_lines, pattern_spec or {}, provider, api_key, base_url, model))
 
 
 def run_deployment_check(activation_text: str, rollback_text: str, generated_code: Optional[str] = None,
-                          identifier_param_names: Optional[list] = None) -> dict:
+                          pattern_spec: Optional[dict] = None, provider: Optional[str] = None,
+                          api_key: Optional[str] = None, base_url: Optional[str] = None,
+                          model: Optional[str] = None) -> dict:
     """Blocking wrapper around run_deployment_check_stream, for the REST endpoint."""
     result = None
-    for kind, payload in run_deployment_check_stream(activation_text, rollback_text, generated_code, identifier_param_names):
+    for kind, payload in run_deployment_check_stream(activation_text, rollback_text, generated_code,
+                                                      pattern_spec, provider, api_key, base_url, model):
         if kind == "done":
             result = payload
     return result
 
 
 def format_check_markdown(result: dict) -> str:
-    """Despite the name (kept for API compatibility), this returns pure HTML, not Markdown —
-    needed so each batch's output can be safely nested inside its own wrapper <div> for
-    per-batch screenshot capture without breaking on Markdown-inside-HTML parsing quirks."""
+    """Renders the AI-decided comparison report — the row/column LABELS themselves come from
+    the AI's judgment of what's meaningful for this specific format (e.g. 'Unique boards' for a
+    Core MGW script instead of a hardcoded, meaningless 'Cells Count: 0'), not a fixed template.
+    Despite the name (kept for API compatibility), this returns pure HTML, not Markdown — needed
+    so each batch's output can be safely nested inside its own wrapper <div> for per-batch
+    screenshot capture without breaking on Markdown-inside-HTML parsing quirks."""
     def badge(is_clear: bool) -> str:
         if is_clear:
             return '<span style="color:#1a7f37;font-weight:600;">🟢 Clear</span>'
@@ -1359,49 +1446,18 @@ def format_check_markdown(result: dict) -> str:
             body_rows += f'<tr style="{style}">{td_cells}</tr>'
         return f'<table style="border-collapse:collapse;width:100%;font-size:14px;"><thead><tr>{th_cells}</tr></thead><tbody>{body_rows}</tbody></table>'
 
-    parts = [f'<h3>{"✅ Clean" if result["clean"] else "⚠️ Issues found"}</h3>']
+    parts = [f'<h3>{"✅ Clean" if result.get("clean") else "⚠️ Issues found"}</h3>']
 
+    stats = result.get("summary_stats") or []
     stats_table = html_table(
         ["Check items", "Activation", "Rollback"],
-        [
-            ["Total lines", result["activation"]["total_lines"], result["rollback"]["total_lines"]],
-            ["Active lines", result["activation"]["active_lines"], result["rollback"]["active_lines"]],
-            ["Unique sites", result["activation"]["unique_sites"], result["rollback"]["unique_sites"]],
-            ["Cells Count", result["activation"]["unique_cells"], result["rollback"]["unique_cells"]],
-            ["Comments (//)", result["activation"]["comment_count"], result["rollback"]["comment_count"]],
-            ["Blank lines", result["activation"]["blank_count"], result["rollback"]["blank_count"]],
-        ],
+        [[s.get("label", ""), s.get("activation", ""), s.get("rollback", "")] for s in stats],
     )
 
-    sm = result["site_mismatch"]
-    sm_clear = not (sm["activation_only"] or sm["rollback_only"])
-    sm_detail = "none" if sm_clear else f"activation-only <code>{sm['activation_only']}</code>, rollback-only <code>{sm['rollback_only']}</code>"
-
-    cm = result["cell_mismatch"]
-    cm_clear = not (cm["activation_only"] or cm["rollback_only"])
-    cm_detail = "none" if cm_clear else f"activation-only <code>{cm['activation_only']}</code>, rollback-only <code>{cm['rollback_only']}</code>"
-
-    ms_a, ms_b = result["activation"]["missing_semicolons"], result["rollback"]["missing_semicolons"]
-    ms_clear = not (ms_a or ms_b)
-    ms_detail = "none" if ms_clear else f"activation lines <code>{ms_a or 'none'}</code>, rollback lines <code>{ms_b or 'none'}</code>"
-
-    sp_a, sp_b = result["activation"]["spread_sites"], result["rollback"]["spread_sites"]
-    sp_clear = not (sp_a or sp_b)
-    sp_detail = "none" if sp_clear else f"activation <code>{sp_a or 'none'}</code>, rollback <code>{sp_b or 'none'}</code>"
-
-    dv = result["duplicate_values"]
-    dv_clear = not dv
-    dv_detail = "none" if dv_clear else f"{len(dv)} found — see table below"
-
+    items = result.get("check_items") or []
     status_table = html_table(
         ["Check items", "Status", "Details"],
-        [
-            ["Site mismatch", badge(sm_clear), sm_detail],
-            ["Cell mismatch", badge(cm_clear), cm_detail],
-            ["Missing semicolons", badge(ms_clear), ms_detail],
-            ["Spread sites", badge(sp_clear), sp_detail],
-            ["Duplicate values", badge(dv_clear), dv_detail],
-        ],
+        [[it.get("label", ""), badge(bool(it.get("clear"))), it.get("details", "")] for it in items],
     )
 
     parts.append(
@@ -1411,36 +1467,40 @@ def format_check_markdown(result: dict) -> str:
         '</div>'
     )
 
+    dv = result.get("duplicate_values") or []
     if dv:
-        dv_rows = [[d["siteId"], d["cellId"], d["paramName"], d["value"], d["actLine"], d["rbLine"]] for d in dv[:50]]
-        dv_table = html_table(["Site", "Cell", "Param", "Value", "Act line", "RB line"], dv_rows)
+        dv_rows = [[d.get("description", ""), d.get("location", ""), d.get("value", "")] for d in dv[:50]]
+        dv_table = html_table(["Description", "Location", "Value"], dv_rows)
         parts.append(f'<p><b>Duplicate values ({len(dv)} found — same value in both scripts):</b></p>{dv_table}')
         if len(dv) > 50:
             parts.append(f'<p><i>...and {len(dv) - 50} more.</i></p>')
 
-    # Parameters table: color-coded by what the current->new relationship actually means —
-    # red = same value in both (the rollback wouldn't change anything, likely a real bug),
-    # amber = missing from one script entirely, green = a normal, healthy reversal
+    # Parameters table: color-coded by what the AI decided the current->new relationship means —
+    # red = same value in both (likely a real bug), amber = missing from one side, green = normal
     ps = result.get("parameter_summary") or []
 
-    def param_status(current, new):
-        if current == new and current != "—":
-            return "same", '<span style="color:#cf222e;font-weight:600;">🔴 Same value</span>', "background:#ffebe9;"
-        if current == "—" or new == "—":
-            return "missing", '<span style="color:#9a6700;font-weight:600;">🟡 Missing in one</span>', "background:#fff8e5;"
-        return "ok", '<span style="color:#1a7f37;font-weight:600;">🟢 Reversed</span>', ""
+    def param_style(status: str):
+        s = (status or "").lower()
+        if s == "same":
+            return '<span style="color:#cf222e;font-weight:600;">🔴 Same value</span>', "background:#ffebe9;"
+        if s == "missing":
+            return '<span style="color:#9a6700;font-weight:600;">🟡 Missing in one</span>', "background:#fff8e5;"
+        return '<span style="color:#1a7f37;font-weight:600;">🟢 Reversed</span>', ""
 
     param_rows, param_styles = [], []
     for p in ps[:100]:
-        _, status_badge, row_style = param_status(p["current"], p["new"])
-        entries_label = f"{p['count']} site/cell entr{'y' if p['count'] == 1 else 'ies'}"
-        param_rows.append([p["paramName"], p["current"], p["new"], status_badge, entries_label])
+        status_badge, row_style = param_style(p.get("status"))
+        param_rows.append([p.get("parameter", ""), p.get("current", ""), p.get("new", ""), status_badge, p.get("applies_to", "")])
         param_styles.append(row_style)
     param_table = html_table(["Parameter", "Current (rollback)", "New (activation)", "Status", "Applies to"], param_rows, param_styles)
 
     parts.append(f'<p><b>Parameters — current (rollback) vs new (activation), {len(ps)} distinct combination(s):</b></p>{param_table}')
     if len(ps) > 100:
         parts.append(f'<p><i>...and {len(ps) - 100} more.</i></p>')
+
+    notes = result.get("notes")
+    if notes:
+        parts.append(f'<p><i>AI notes: {notes}</i></p>')
 
     return "".join(parts)
 
@@ -1610,19 +1670,28 @@ def do_save_pattern(name, last_result):
     return f"✅ Saved as '{name}'. {len(patterns)} pattern(s) in {PATTERNS_FILE}.", gr.update(value=table)
 
 
-def gradio_check(pattern_name, pattern_file, deployment_files):
+def gradio_check(pattern_name, pattern_file, deployment_files, provider, anthropic_key, anthropic_url, anthropic_model,
+                  huawei_key, huawei_url, huawei_model):
     """Deployment: any user picks a saved pattern (or imports one directly), uploads their real
     files — one or many activation/rollback pairs at once, auto-paired by CONTENT (role from
     -1/-0 suffix majority, pairing from shared site IDs via the selected pattern's own parser) —
-    and gets a check report per pair. Filenames are never inspected at all. 100% deterministic:
-    no AI calls happen here, it only runs the pattern's generated parser. If that parser isn't
-    available, this fails clearly upfront."""
+    and gets a check report per pair. Filenames are never inspected at all. Extraction (raw text
+    -> structured lines) is deterministic via the generated parser, but the comparison/report
+    itself is now 100% AI-decided (generate_summary_comparison) — this makes a real AI call per
+    batch and requires credentials, unlike the previous fully-deterministic version."""
     if not deployment_files:
         yield ("⚠️ Upload at least one activation + rollback file pair.", "", "")
         return
 
+    resolved_provider, resolved_key, resolved_url, resolved_model = resolve_credentials(
+        provider, anthropic_key, anthropic_url, anthropic_model, huawei_key, huawei_url, huawei_model)
+    config_issue = provider_config_status(resolved_provider, resolved_key, resolved_url, resolved_model)
+    if config_issue:
+        yield (f"⚠️ The AI comparison step needs credentials — {config_issue}", "", "")
+        return
+
     if pattern_file:
-        generated_code, diagnostic, source_name, identifier_param_names = load_pattern_from_upload(pattern_file)
+        generated_code, diagnostic, source_name, pattern_spec = load_pattern_from_upload(pattern_file)
         source_desc = f"imported pattern file ('{source_name}')"
     elif pattern_name:
         match = next((p for p in load_saved_patterns() if p["name"] == pattern_name), None)
@@ -1630,7 +1699,7 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
             yield (f"⚠️ Pattern '{pattern_name}' not found — try refreshing the pattern list.", "", "")
             return
         generated_code, diagnostic = usable_generated_code(match)
-        identifier_param_names = (match.get("pattern") or {}).get("identifierParamNames")
+        pattern_spec = match.get("pattern")
         source_desc = f"saved pattern '{pattern_name}'"
     else:
         yield ("⚠️ Select a saved pattern, or import a pattern file.", "", "")
@@ -1652,10 +1721,11 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
 
     all_markdown, all_results = [], {}
     for pair in pairs:
-        log_lines.append(f"\nChecking batch: {pair['label']}...")
+        log_lines.append(f"\nChecking batch: {pair['label']} (AI comparing)...")
         yield ("\n".join(log_lines), "", "")
         try:
-            result = run_deployment_check(pair["activation_text"], pair["rollback_text"], generated_code, identifier_param_names)
+            result = run_deployment_check(pair["activation_text"], pair["rollback_text"], generated_code,
+                                           pattern_spec, resolved_provider, resolved_key, resolved_url, resolved_model)
             all_results[pair["label"]] = result
             batch_id = "batch-result-" + re.sub(r"[^a-zA-Z0-9_-]", "_", pair["label"])
             batch_content = format_check_markdown(result)
@@ -1889,7 +1959,8 @@ with gr.Blocks(title="AI Memorize Your Pattern") as demo:
 
     check_btn.click(
         gradio_check,
-        inputs=[pattern_select_in, pattern_file_in, deploy_files_in],
+        inputs=[pattern_select_in, pattern_file_in, deploy_files_in, shared_provider_in,
+                anthropic_key_in, anthropic_url_in, anthropic_model_in, huawei_key_in, huawei_url_in, huawei_model_in],
         outputs=[check_progress_out, check_result_out, check_json_out],
         show_progress="minimal",
     ).then(
