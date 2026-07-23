@@ -1682,13 +1682,14 @@ def do_save_pattern(name, last_result):
     return f"✅ Saved as '{name}'. {len(patterns)} pattern(s) in {PATTERNS_FILE}.", gr.update(value=table)
 
 
-def gradio_check(pattern_name, pattern_file, deployment_files):
+def gradio_check(pattern_name, pattern_file, deployment_files, progress=gr.Progress()):
     """Deployment: any user picks a saved pattern (or imports one directly), uploads their real
     files — one or many activation/rollback pairs at once, auto-paired by CONTENT (role from
     -1/-0 suffix majority, pairing from shared site IDs via the selected pattern's own parser) —
     and gets a check report per pair. Filenames are never inspected at all. 100% deterministic:
     no AI calls happen here, it only runs the pattern's generated parser. If that parser isn't
     available, this fails clearly upfront."""
+    progress(0, desc="Loading pattern...")
     if not deployment_files:
         yield ("⚠️ Upload at least one activation + rollback file pair.", "", "")
         return
@@ -1712,6 +1713,7 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
         yield (f"⚠️ Can't use this pattern — {diagnostic}", "", "")
         return
 
+    progress(0.05, desc="Pairing files by content...")
     pairs, warnings = pair_deployment_files_by_content(deployment_files, generated_code)
     log_lines = [f"Using {source_desc}.", f"{len(pairs)} activation/rollback pair(s) matched by content (site overlap), filenames ignored."]
     for w in warnings:
@@ -1723,7 +1725,9 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
     yield ("\n".join(log_lines), "", "")
 
     all_markdown, all_results = [], {}
-    for pair in pairs:
+    total = len(pairs)
+    for i, pair in enumerate(pairs):
+        progress(min(0.05 + 0.9 * (i / total), 0.95), desc=f"Checking batch {i + 1}/{total}: {pair['label']}")
         log_lines.append(f"\nChecking batch: {pair['label']}...")
         yield ("\n".join(log_lines), "", "")
         try:
@@ -1745,6 +1749,7 @@ def gradio_check(pattern_name, pattern_file, deployment_files):
             log_lines.append(f"  ❌ Failed: {type(e).__name__}: {e}")
             all_markdown.append(f"<h2>Batch: {pair['label']}</h2><p>❌ Check failed: {type(e).__name__}: {e}</p>")
 
+    progress(1.0, desc="Done")
     log_lines.append("\nDone.")
     yield ("\n".join(log_lines), "".join(all_markdown), json.dumps(all_results, indent=2))
 
@@ -1964,7 +1969,7 @@ with gr.Blocks(title="AI Memorize Your Pattern") as demo:
         gradio_check,
         inputs=[pattern_select_in, pattern_file_in, deploy_files_in],
         outputs=[check_progress_out, check_result_out, check_json_out],
-        show_progress="minimal",
+        show_progress=full",
     ).then(
         _token_values, outputs=[input_tok_out, output_tok_out, cached_tok_out, cost_out],
     )
