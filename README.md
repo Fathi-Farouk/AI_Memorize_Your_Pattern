@@ -112,11 +112,11 @@ def parse_line(line: str, context: dict) -> dict | None:
 
 ### Output result
 
-__for clear script:
+for clear script:
 
 <img width="1097" height="552" alt="image" src="https://github.com/user-attachments/assets/48225a90-1a88-42a8-94f6-eb3a7c903fe2" />
 
-__For issued script:
+For issued script:
 
 <img width="1071" height="727" alt="o-------" src="https://github.com/user-attachments/assets/97b302e8-838e-41d2-912f-0eeb8b35fedc" />
 
