@@ -18,6 +18,9 @@ This provides the flexibility of AI without depending on repeated, expensive, an
 
 The system operates in two main phases:
 
+<img width="1024" height="1536" alt="ai memorize your pattern" src="https://github.com/user-attachments/assets/e4155d98-051c-4228-a457-e6889ea1f10c" />
+
+
 ### Phase 1 — AI Training
 
 An administrator or RF expert provides:
@@ -106,3 +109,12 @@ For example, it generates functions such as:
 ```python
 def parse_line(line: str, context: dict) -> dict | None:
     ...
+
+### Output result
+
+__for clear script:
+<img width="1097" height="552" alt="image" src="https://github.com/user-attachments/assets/48225a90-1a88-42a8-94f6-eb3a7c903fe2" />
+
+__For issued script:
+
+<img width="1071" height="727" alt="image" src="https://github.com/user-attachments/assets/0784cf3d-b58d-4581-ba72-c8f3a94df909" />
